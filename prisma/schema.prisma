@@ -1,0 +1,382 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────
+
+enum MatchStatus {
+  WAITING
+  STARTED
+  LINE_COMPLETED
+  COMPLETED
+  CANCELLED
+}
+
+enum PlayerMatchResult {
+  PENDING
+  LINE_WINNER
+  FULL_HOUSE_WINNER
+  BOTH_WINNER
+  LOST
+}
+
+enum TransactionType {
+  DEPOSIT
+  WITHDRAWAL
+  GAME_ENTRY
+  WINNING
+  REFERRAL_REWARD
+  GIFT
+  BOT_WINNING
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  REJECTED_FRAUD
+  REJECTED_MISMATCH
+  PAID
+}
+
+enum ReferralStatus {
+  PENDING
+  AWARDED
+  EXPIRED
+}
+
+// ─────────────────────────────────────────────────────────────
+// User
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id                  String   @id @default(cuid())
+  username            String   @unique
+  inviteCode          String   @unique
+  email               String?
+  phoneNumber         String?  @unique
+  password            String? // nullable for guests
+  fullName            String?
+  isGuest             Boolean  @default(true)
+  isNewPlayer         Boolean  @default(true)
+  completedGames      Int      @default(0)
+  credit              Decimal  @default(0) @db.Decimal(15, 2)
+  withdrawableBalance Decimal  @default(0) @db.Decimal(15, 2)
+  referralRewardUsed  Boolean  @default(false)
+  referrerId          String?
+  shebaNumber         String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  // Relations
+  referrer               User?               @relation("UserReferrals", fields: [referrerId], references: [id])
+  referredUsers          User[]              @relation("UserReferrals")
+  playerMatches          PlayerMatch[]
+  transactions           Transaction[]
+  withdrawalRequests     WithdrawalRequest[]
+  referralsAsReferrer    Referral[]          @relation("Referrer")
+  referralsAsReferred    Referral?           @relation("ReferredUser")
+  lineWinnerMatches      Match[]             @relation("LineWinner")
+  fullHouseWinnerMatches Match[]             @relation("FullHouseWinner")
+
+  @@index([username])
+  @@index([inviteCode])
+  @@index([phoneNumber])
+  @@index([isGuest])
+  @@index([isNewPlayer])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Room
+// ─────────────────────────────────────────────────────────────
+
+model Room {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  entryFee   Decimal  @db.Decimal(15, 2)
+  minCards   Int      @default(1)
+  maxCards   Int      @default(4)
+  isActive   Boolean  @default(true)
+  botEnabled Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // Relations
+  matches Match[]
+
+  @@index([isActive])
+  @@index([entryFee])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Card
+// ─────────────────────────────────────────────────────────────
+
+model Card {
+  id        String   @id @default(cuid())
+  numbers   Json // flat [15 numbers] — quick set ops
+  layout    Json // { rows: number[], cols: number[] } per number index
+  isActive  Boolean  @default(true) // can be picked from the pool
+  createdAt DateTime @default(now())
+
+  // Relations
+  playerMatchCards PlayerMatchCard[]
+
+  @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Match
+// ─────────────────────────────────────────────────────────────
+
+model Match {
+  id                String      @id @default(cuid())
+  roomId            String
+  roomEntryFee      Decimal     @db.Decimal(15, 2)
+  status            MatchStatus @default(WAITING)
+  totalCards        Int         @default(0)
+  startTime         DateTime?
+  endTime           DateTime?
+  calledNumbers     Json? // ordered array of called numbers
+  lineWinnerId      String?
+  linePrize         Decimal?    @db.Decimal(15, 2)
+  fullHouseWinnerId String?
+  fullHousePrize    Decimal?    @db.Decimal(15, 2)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  // Relations
+  room            Room            @relation(fields: [roomId], references: [id])
+  lineWinner      User?           @relation("LineWinner", fields: [lineWinnerId], references: [id])
+  fullHouseWinner User?           @relation("FullHouseWinner", fields: [fullHouseWinnerId], references: [id])
+  playerMatches   PlayerMatch[]
+  matchNumbers    MatchNumber[]
+  criticalStates  CriticalState[]
+
+  @@index([roomId])
+  @@index([status])
+  @@index([startTime])
+  @@index([endTime])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// PlayerMatch
+//
+// A player's participation in one match. Cards are linked via
+// PlayerMatchCard (many-to-many), because a player can bring
+// 1–4 cards into a match.
+// ─────────────────────────────────────────────────────────────
+
+model PlayerMatch {
+  id              String            @id @default(cuid())
+  matchId         String
+  userId          String?
+  cardCount       Int
+  entryAmount     Decimal           @db.Decimal(15, 2)
+  isBot           Boolean           @default(false)
+  botUsername     String?
+  botStats        Json? // { games, lineWins, fullHouseWins }
+  result          PlayerMatchResult @default(PENDING)
+  prizeAmount     Decimal?          @db.Decimal(15, 2)
+  lineWinner      Boolean           @default(false)
+  fullHouseWinner Boolean           @default(false)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  // Relations
+  match          Match             @relation(fields: [matchId], references: [id])
+  user           User?             @relation(fields: [userId], references: [id])
+  playerCards    PlayerMatchCard[]
+  criticalStates CriticalState[]
+
+  @@unique([matchId, userId]) // one row per user per match
+  @@index([matchId])
+  @@index([userId])
+  @@index([isBot])
+  @@index([result])
+}
+
+// ─────────────────────────────────────────────────────────────
+// PlayerMatchCard
+//
+// Links a card to a player's participation in a match.
+// A card CAN be referenced by many matches at the same time.
+// ─────────────────────────────────────────────────────────────
+
+model PlayerMatchCard {
+  id            String   @id @default(cuid())
+  playerMatchId String
+  cardId        String
+  createdAt     DateTime @default(now())
+
+  // Relations
+  playerMatch PlayerMatch @relation(fields: [playerMatchId], references: [id], onDelete: Cascade)
+  card        Card        @relation(fields: [cardId], references: [id])
+
+  @@unique([playerMatchId, cardId])
+  @@index([playerMatchId])
+  @@index([cardId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// MatchNumber
+// ─────────────────────────────────────────────────────────────
+
+model MatchNumber {
+  id         String   @id @default(cuid())
+  matchId    String
+  number     Int // 1-90
+  calledAt   DateTime @default(now())
+  orderIndex Int
+
+  match Match @relation(fields: [matchId], references: [id])
+
+  @@unique([matchId, number])
+  @@index([matchId])
+  @@index([number])
+  @@index([orderIndex])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Transaction
+// ─────────────────────────────────────────────────────────────
+
+model Transaction {
+  id            String            @id @default(cuid())
+  userId        String
+  type          TransactionType
+  amount        Decimal           @db.Decimal(15, 2)
+  balanceBefore Decimal           @db.Decimal(15, 2)
+  balanceAfter  Decimal           @db.Decimal(15, 2)
+  status        TransactionStatus @default(PENDING)
+  referenceId   String?
+  description   String?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([type])
+  @@index([status])
+  @@index([createdAt])
+  @@index([referenceId])
+}
+
+// ─────────────────────────────────────────────────────────────
+// WithdrawalRequest
+// ─────────────────────────────────────────────────────────────
+
+model WithdrawalRequest {
+  id         String           @id @default(cuid())
+  userId     String
+  amount     Decimal          @db.Decimal(15, 2)
+  iban       String
+  fullName   String
+  status     WithdrawalStatus @default(PENDING)
+  adminNotes String?
+  reviewedAt DateTime?
+  reviewedBy String?
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Referral
+// ─────────────────────────────────────────────────────────────
+
+model Referral {
+  id                  String         @id @default(cuid())
+  referrerId          String
+  referredUserId      String         @unique
+  rewardAmount        Decimal        @db.Decimal(15, 2)
+  status              ReferralStatus @default(PENDING)
+  firstPurchaseAmount Decimal?       @db.Decimal(15, 2)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  referrer     User @relation("Referrer", fields: [referrerId], references: [id])
+  referredUser User @relation("ReferredUser", fields: [referredUserId], references: [id])
+
+  @@index([referrerId])
+  @@index([referredUserId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bot
+// ─────────────────────────────────────────────────────────────
+
+model Bot {
+  id        String   @id @default(cuid())
+  username  String   @unique
+  stats     Json // { games, lineWins, fullHouseWins }
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Setting
+// ─────────────────────────────────────────────────────────────
+
+model Setting {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([key])
+}
+
+// ─────────────────────────────────────────────────────────────
+// CriticalState
+//
+// Runtime tracking for cards that are 5 numbers away from
+// Full House. Used to prevent simultaneous wins (docs page 12).
+// Note: `cardId` here refers to the Card id snapshot, and
+// `playerMatchId` identifies the player+match context.
+// ─────────────────────────────────────────────────────────────
+
+model CriticalState {
+  id               String    @id @default(cuid())
+  matchId          String
+  cardId           String
+  playerMatchId    String
+  remainingNumbers Json // numbers not yet called
+  sharedNumbers    Json? // shared numbers with other critical cards
+  enteredAt        DateTime  @default(now())
+  resolvedAt       DateTime?
+
+  match       Match       @relation(fields: [matchId], references: [id])
+  playerMatch PlayerMatch @relation(fields: [playerMatchId], references: [id])
+
+  @@unique([matchId, cardId, playerMatchId])
+  @@index([matchId])
+  @@index([cardId])
+  @@index([playerMatchId])
+  @@index([enteredAt])
+}
