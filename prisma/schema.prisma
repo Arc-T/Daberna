@@ -68,7 +68,7 @@ model User {
   inviteCode          String   @unique
   email               String?
   phoneNumber         String?  @unique
-  password            String? // nullable for guests
+  password            String?
   fullName            String?
   isGuest             Boolean  @default(true)
   isNewPlayer         Boolean  @default(true)
@@ -81,7 +81,6 @@ model User {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  // Relations
   referrer               User?               @relation("UserReferrals", fields: [referrerId], references: [id])
   referredUsers          User[]              @relation("UserReferrals")
   playerMatches          PlayerMatch[]
@@ -91,6 +90,7 @@ model User {
   referralsAsReferred    Referral?           @relation("ReferredUser")
   lineWinnerMatches      Match[]             @relation("LineWinner")
   fullHouseWinnerMatches Match[]             @relation("FullHouseWinner")
+  notifications          Notification[]
 
   @@index([username])
   @@index([inviteCode])
@@ -114,7 +114,6 @@ model Room {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  // Relations
   matches Match[]
 
   @@index([isActive])
@@ -123,23 +122,30 @@ model Room {
 
 // ─────────────────────────────────────────────────────────────
 // Card
+//
+// Static data — a fixed set of 15 numbers + layout.
+// Cards are picked per-match from this table.
+// No "usedInMatch" flag: cards are reusable across matches.
 // ─────────────────────────────────────────────────────────────
 
 model Card {
   id        String   @id @default(cuid())
-  numbers   Json // flat [15 numbers] — quick set ops
+  numbers   Json // [15 unique numbers], sorted per column
   layout    Json // { rows: number[], cols: number[] } per number index
-  isActive  Boolean  @default(true) // can be picked from the pool
+  isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
-  // Relations
-  playerMatchCards PlayerMatchCard[]
+  matchCards MatchCard[]
 
   @@index([isActive])
 }
 
 // ─────────────────────────────────────────────────────────────
 // Match
+//
+// NOTE: lineWinnerId / fullHouseWinnerId are kept for the
+// "single winner" case. When there's a tie, the prize is split
+// and both winners get MatchWinner rows (see below).
 // ─────────────────────────────────────────────────────────────
 
 model Match {
@@ -158,13 +164,19 @@ model Match {
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 
+  // ── Money fields — all required, snapshot of the match's economics
+  platformCut   Decimal @default(0) @db.Decimal(15, 2) // 10% commission
+  linePool      Decimal @default(0) @db.Decimal(15, 2) // 10% line prize pool
+  fullHousePool Decimal @default(0) @db.Decimal(15, 2) // 80% full-house pool
+  botWinnings   Decimal @default(0) @db.Decimal(15, 2) // accumulated bot wins
+
   // Relations
-  room            Room            @relation(fields: [roomId], references: [id])
-  lineWinner      User?           @relation("LineWinner", fields: [lineWinnerId], references: [id])
-  fullHouseWinner User?           @relation("FullHouseWinner", fields: [fullHouseWinnerId], references: [id])
+  room            Room          @relation(fields: [roomId], references: [id])
+  lineWinner      User?         @relation("LineWinner", fields: [lineWinnerId], references: [id])
+  fullHouseWinner User?         @relation("FullHouseWinner", fields: [fullHouseWinnerId], references: [id])
   playerMatches   PlayerMatch[]
   matchNumbers    MatchNumber[]
-  criticalStates  CriticalState[]
+  matchCards      MatchCard[]
 
   @@index([roomId])
   @@index([status])
@@ -176,9 +188,8 @@ model Match {
 // ─────────────────────────────────────────────────────────────
 // PlayerMatch
 //
-// A player's participation in one match. Cards are linked via
-// PlayerMatchCard (many-to-many), because a player can bring
-// 1–4 cards into a match.
+// A player's participation in one match.
+// Cards are linked via MatchCard.assignedTo.
 // ─────────────────────────────────────────────────────────────
 
 model PlayerMatch {
@@ -197,13 +208,11 @@ model PlayerMatch {
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
 
-  // Relations
-  match          Match             @relation(fields: [matchId], references: [id])
-  user           User?             @relation(fields: [userId], references: [id])
-  playerCards    PlayerMatchCard[]
-  criticalStates CriticalState[]
+  match      Match       @relation(fields: [matchId], references: [id])
+  user       User?       @relation(fields: [userId], references: [id])
+  matchCards MatchCard[]
 
-  @@unique([matchId, userId]) // one row per user per match
+  @@unique([matchId, userId])
   @@index([matchId])
   @@index([userId])
   @@index([isBot])
@@ -211,25 +220,32 @@ model PlayerMatch {
 }
 
 // ─────────────────────────────────────────────────────────────
-// PlayerMatchCard
+// MatchCard
 //
-// Links a card to a player's participation in a match.
-// A card CAN be referenced by many matches at the same time.
+// The per-match 100-card pool. Each Match has N cards (default 100).
+// When a card is assigned to a player, `assignedTo` points to the
+// PlayerMatch row.
+//
+// @@unique([matchId, cardId]) enforces "no duplicate card within
+// a single match" — the exact rule from Daberna-2 (page 9).
 // ─────────────────────────────────────────────────────────────
 
-model PlayerMatchCard {
-  id            String   @id @default(cuid())
-  playerMatchId String
-  cardId        String
-  createdAt     DateTime @default(now())
+model MatchCard {
+  id         String    @id @default(cuid())
+  matchId    String
+  cardId     String
+  assignedTo String? // playerMatchId once assigned
+  assignedAt DateTime?
+  createdAt  DateTime  @default(now())
 
-  // Relations
-  playerMatch PlayerMatch @relation(fields: [playerMatchId], references: [id], onDelete: Cascade)
-  card        Card        @relation(fields: [cardId], references: [id])
+  match       Match        @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  card        Card         @relation(fields: [cardId], references: [id])
+  playerMatch PlayerMatch? @relation(fields: [assignedTo], references: [id])
 
-  @@unique([playerMatchId, cardId])
-  @@index([playerMatchId])
+  @@unique([matchId, cardId])
+  @@index([matchId])
   @@index([cardId])
+  @@index([assignedTo])
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -239,7 +255,7 @@ model PlayerMatchCard {
 model MatchNumber {
   id         String   @id @default(cuid())
   matchId    String
-  number     Int // 1-90
+  number     Int // 1–90
   calledAt   DateTime @default(now())
   orderIndex Int
 
@@ -257,7 +273,7 @@ model MatchNumber {
 
 model Transaction {
   id            String            @id @default(cuid())
-  userId        String
+  userId        String?
   type          TransactionType
   amount        Decimal           @db.Decimal(15, 2)
   balanceBefore Decimal           @db.Decimal(15, 2)
@@ -268,7 +284,7 @@ model Transaction {
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 
-  user User @relation(fields: [userId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
 
   @@index([userId])
   @@index([type])
@@ -338,6 +354,56 @@ model Bot {
   @@index([isActive])
 }
 
+enum NotificationType {
+  DEPOSIT_SUCCESS
+  DEPOSIT_FAILED
+  WITHDRAWAL_REQUESTED
+  WITHDRAWAL_APPROVED
+  WITHDRAWAL_REJECTED
+  PRIZE_RECEIVED
+  MATCH_RESULT
+  LINE_WIN
+  FULL_HOUSE_WIN
+  MATCH_ENDED
+  REFERRAL_SUCCESS
+  REFERRAL_REWARD
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  payload   Json
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// AdminLog
+//
+// Docs page 55, 62, 69.
+// ─────────────────────────────────────────────────────────────
+
+model AdminLog {
+  id         String   @id @default(cuid())
+  adminId    String
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
 // ─────────────────────────────────────────────────────────────
 // Setting
 // ─────────────────────────────────────────────────────────────
@@ -350,33 +416,4 @@ model Setting {
   updatedAt   DateTime @updatedAt
 
   @@index([key])
-}
-
-// ─────────────────────────────────────────────────────────────
-// CriticalState
-//
-// Runtime tracking for cards that are 5 numbers away from
-// Full House. Used to prevent simultaneous wins (docs page 12).
-// Note: `cardId` here refers to the Card id snapshot, and
-// `playerMatchId` identifies the player+match context.
-// ─────────────────────────────────────────────────────────────
-
-model CriticalState {
-  id               String    @id @default(cuid())
-  matchId          String
-  cardId           String
-  playerMatchId    String
-  remainingNumbers Json // numbers not yet called
-  sharedNumbers    Json? // shared numbers with other critical cards
-  enteredAt        DateTime  @default(now())
-  resolvedAt       DateTime?
-
-  match       Match       @relation(fields: [matchId], references: [id])
-  playerMatch PlayerMatch @relation(fields: [playerMatchId], references: [id])
-
-  @@unique([matchId, cardId, playerMatchId])
-  @@index([matchId])
-  @@index([cardId])
-  @@index([playerMatchId])
-  @@index([enteredAt])
 }

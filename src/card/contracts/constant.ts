@@ -12,7 +12,7 @@ export const COLUMN_RANGES: [number, number][] = [
     [50, 59],
     [60, 69],
     [70, 79],
-    [80, 90],
+    [80, 90]
 ];
 
 export const MAX_SHARED_NUMBERS = 4;
@@ -20,3 +20,5 @@ export const MAX_SHARED_NUMBERS = 4;
 export const DEFAULT_CARDS_POOL_SIZE = 50;
 
 export const MAX_SHARED_IN_SAME_ROW = 2;
+
+export const CARDS_PER_MATCH = 30;

@@ -1,12 +1,15 @@
 import { Injectable, Logger } from "@nestjs/common";
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 import { WsException } from "@nestjs/websockets";
-import { LobbyResponseDto, LobbyState } from "../contracts/requests/lobby-request.js";
+
+import { LobbyResponseDto, LobbyState } from "../contracts/requests/lobby-request.dto.js";
+import { JoinLobbyDto } from "../contracts/requests/join-lobby.dto.js";
+
 import { RoomRepository } from "../../room/repositories/room.repository.js";
 import { RoomStatusDto } from "../../room/contracts/response/room-status.dto.js";
 import {
-    MAX_ROOM_CARDS,
     MIN_ROOM_CARDS,
+    MAX_ROOM_CARDS,
     MAX_CARDS_PER_MATCH,
     MIN_CARDS_TO_START
 } from "../../room/contracts/constants/room.constant.js";
@@ -15,8 +18,11 @@ import {
     SECOND_WINDOW_MS as SECOND_LOBBY_WAITING_TIME_MS,
     BOT_FILL_MIN_DELAY_MS,
     BOT_FILL_MAX_DELAY_MS,
-    MAX_BOT_FILL_ATTEMPTS
+    BOT_FILL_START_SECOND,
+    BOT_FILL_END_SECOND,
+    MAX_BOTS_PER_MATCH
 } from "../contracts/constants/lobby.constant.js";
+
 import { UserRepository } from "../../user/repositories/user.repository.js";
 import { PrismaService } from "../../infrastructure/database/prisma.service.js";
 import { MatchService } from "../../match/services/match.service.js";
@@ -49,6 +55,75 @@ export class LobbyService {
     setServer(server: Server) {
         this.server = server;
     }
+
+    async onClientConnected(client: Socket): Promise<void> {
+        this.logger.debug(`client connected: ${client.id}`);
+        try {
+            const rooms = await this.getAllRoomsWithStatus();
+            client.emit("rooms-status", rooms);
+        } catch (err) {
+            this.logger.error(`failed to send rooms-status to ${client.id}`, err);
+            client.disconnect();
+        }
+    }
+
+    async onClientDisconnected(client: Socket): Promise<void> {
+        const userId = client.data.userId as string | undefined;
+        if (!userId) {
+            this.logger.debug(`client ${client.id} disconnected (never joined)`);
+            return;
+        }
+
+        await this.handleDisconnect(userId);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Watch / Unwatch (passive)
+    // ─────────────────────────────────────────────────────────────
+
+    async watchLobby(client: Socket, roomId: string): Promise<{ success: boolean; roomId: string }> {
+        client.join(`lobby-${roomId}`);
+
+        const status = this.getLobbyStatus(roomId);
+        client.emit("lobby-update", status);
+
+        return { success: true, roomId };
+    }
+
+    async unwatchLobby(client: Socket, roomId: string): Promise<{ success: boolean }> {
+        client.leave(`lobby-${roomId}`);
+        return { success: true };
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Join (active)
+    // ─────────────────────────────────────────────────────────────
+
+    async joinLobby(client: Socket, dto: JoinLobbyDto): Promise<LobbyState> {
+        const lobby = await this.enterLobby(dto.userId, dto.name, dto.roomId, dto.cardCount);
+
+        // Track on socket for disconnect handling
+        client.data.userId = dto.userId;
+        client.data.roomId = dto.roomId;
+        client.join(`lobby-${dto.roomId}`);
+
+        // Acknowledge to the caller
+        client.emit("joined-lobby", {
+            success: true,
+            roomId: dto.roomId,
+            cardCount: dto.cardCount,
+            totalCards: lobby.totalCards
+        });
+
+        // Fan out
+        await this.broadcastRoomUpdates(dto.roomId);
+
+        return lobby;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Read
+    // ─────────────────────────────────────────────────────────────
 
     getLobbyStatus(roomId: string): LobbyResponseDto {
         const lobby = this.lobby.get(roomId);
@@ -89,6 +164,18 @@ export class LobbyService {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // Broadcast
+    // ─────────────────────────────────────────────────────────────
+
+    private async broadcastRoomUpdates(roomId: string): Promise<void> {
+        const status = this.getLobbyStatus(roomId);
+        this.server?.to(`lobby-${roomId}`).emit("lobby-update", status);
+
+        const allRooms = await this.getAllRoomsWithStatus();
+        this.server?.emit("rooms-status", allRooms);
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // Enter
     // ─────────────────────────────────────────────────────────────
 
@@ -120,13 +207,17 @@ export class LobbyService {
         }
 
         // ── Validate user + balance
-        const user = await this.userRepository.findById(userId)!;
+        const user = await this.userRepository.findById(userId);
         if (!user) throw new WsException("کاربر یافت نشد.");
 
         const cost = cardCount * Number(room.entryFee);
         if (Number(user.credit) < cost) {
             throw new WsException("موجودی کافی نیست.");
         }
+
+        // ── Referral co-room rule (Daberna-2, page 60)
+        // inviter and invitee must NOT share a room
+        await this.assertNoReferralConflict(userId, lobby);
 
         // ── Atomic: deduct + transaction
         await this.prisma.$transaction(async (tx) => {
@@ -150,7 +241,7 @@ export class LobbyService {
         });
 
         // ── Add player
-        const isLobbyEmpty = lobby.players.length === 0;
+        const wasEmpty = lobby.players.length === 0;
 
         lobby.players.push({
             id: userId,
@@ -166,9 +257,10 @@ export class LobbyService {
 
         this.logger.debug(`User ${userId} entered lobby ${roomId} with ${cardCount} cards (cost: ${cost})`);
 
-        // ── First player → schedule windows
-        if (isLobbyEmpty) {
+        // ── First player → schedule windows + bot entry timer
+        if (wasEmpty) {
             this.scheduleWaiting(roomId);
+            this.scheduleBotEntry(roomId);
         }
 
         // ── Instant full → cancel + finalize
@@ -181,7 +273,38 @@ export class LobbyService {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Windows
+    // Referral co-room guard
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Daberna-2, page 60:
+     *   The inviter and invitee cannot share a room or a match.
+     */
+    private async assertNoReferralConflict(userId: string, lobby: LobbyState): Promise<void> {
+        const myReferrer = await this.prisma.user.findUnique({
+            where: { id: userId },
+            select: { referrerId: true }
+        });
+
+        const myReferrals = await this.prisma.referral.findMany({
+            where: { referrerId: userId },
+            select: { referredUserId: true }
+        });
+
+        const myReferrerId = myReferrer?.referrerId ?? null;
+        const myReferralIds = myReferrals.map((r) => r.referredUserId);
+
+        const conflict = lobby.players.some(
+            (p) => p.id !== null && (p.id === myReferrerId || myReferralIds.includes(p.id))
+        );
+
+        if (conflict) {
+            throw new WsException("شما و دعوت‌کننده/دعوت‌شده‌ی شما نمی‌توانید در یک روم باشید.");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Waiting windows
     // ─────────────────────────────────────────────────────────────
 
     private scheduleWaiting(roomId: string): void {
@@ -189,19 +312,19 @@ export class LobbyService {
 
         const t1 = setTimeout(() => {
             this.handleFirstPeriodTime(roomId).catch((err) =>
-                this.logger.error(`first time period failed for ${roomId}`, err)
+                this.logger.error(`first period failed for ${roomId}`, err)
             );
         }, FIRST_LOBBY_WAITING_TIME_MS);
 
         const t2 = setTimeout(() => {
             this.handleSecondPeriodTime(roomId).catch((err) =>
-                this.logger.error(`second time period  failed for ${roomId}`, err)
+                this.logger.error(`second period failed for ${roomId}`, err)
             );
         }, FIRST_LOBBY_WAITING_TIME_MS + SECOND_LOBBY_WAITING_TIME_MS);
 
         this.lobbyTimers.set(roomId, [t1, t2]);
 
-        this.logger.debug(`Scheduled windows for room ${roomId}`);
+        this.logger.debug(`Scheduled waiting windows for room ${roomId}`);
     }
 
     private cancelWaiting(roomId: string): void {
@@ -211,7 +334,7 @@ export class LobbyService {
         timers.forEach(clearTimeout);
         this.lobbyTimers.delete(roomId);
 
-        this.logger.debug(`Cancelled windows for room ${roomId}`);
+        this.logger.debug(`Cancelled waiting windows for room ${roomId}`);
     }
 
     private async handleFirstPeriodTime(roomId: string): Promise<void> {
@@ -221,23 +344,23 @@ export class LobbyService {
         lobby.firstPeriodTimeFired = true;
         this.lobby.set(roomId, lobby);
 
-        this.logger.debug(`1rst period time fired for room ${roomId}`);
+        this.logger.debug(`First period fired for room ${roomId}`);
 
         if (lobby.totalCards >= MIN_CARDS_TO_START) {
             this.cancelWaiting(roomId);
             await this.finalizeLobby(roomId);
         }
-        // else → wait for window-2
+        // else → wait for the second period
     }
 
     private async handleSecondPeriodTime(roomId: string): Promise<void> {
         const lobby = this.lobby.get(roomId);
         if (!lobby || lobby.status !== "WAITING") return;
 
-        lobby.secondWindowFired = true;
+        lobby.secondPeriodTimeFired = true;
         this.lobby.set(roomId, lobby);
 
-        this.logger.debug(`2nd period time fired for room ${roomId}`);
+        this.logger.debug(`Second period fired for room ${roomId}`);
 
         if (lobby.totalCards >= MIN_CARDS_TO_START) {
             this.cancelWaiting(roomId);
@@ -245,13 +368,35 @@ export class LobbyService {
             return;
         }
 
-        // Not enough → start bot fill
+        // Not enough players → start bot fill
         await this.startBotFill(roomId);
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Bot fill
+    // Bot fill (Daberna-2, pages 27–28)
+    //
+    //   • Bots start joining from second 20
+    //   • Bots stop joining at second 80
+    //   • Max 15 bots per match
+    //   • Interval between bot joins: 5–15s (Remote Config)
+    //   • Stop early if totalCards ≥ 5 (min to start)
     // ─────────────────────────────────────────────────────────────
+
+    private scheduleBotEntry(roomId: string): void {
+        setTimeout(() => {
+            this.onBotEntryWindowOpen(roomId).catch((err) => this.logger.error(`bot entry failed for ${roomId}`, err));
+        }, BOT_FILL_START_SECOND * 1000);
+    }
+
+    private async onBotEntryWindowOpen(roomId: string): Promise<void> {
+        const lobby = this.lobby.get(roomId);
+        if (!lobby || lobby.status !== "WAITING") return;
+
+        // If already at minimum before the window opened, skip
+        if (lobby.totalCards >= MIN_CARDS_TO_START) return;
+
+        await this.startBotFill(roomId);
+    }
 
     private async startBotFill(roomId: string): Promise<void> {
         const lobby = this.lobby.get(roomId);
@@ -262,14 +407,21 @@ export class LobbyService {
 
         this.logger.debug(`Room ${roomId}: starting bot fill`);
 
-        let attempts = 0;
+        const windowStart = new Date(lobby.createdAt).getTime();
+        let botsAdded = 0;
 
-        while (attempts < MAX_BOT_FILL_ATTEMPTS) {
-            attempts++;
+        while (botsAdded < MAX_BOTS_PER_MATCH) {
+            // Guard: stop if the entry window has closed
+            const elapsedSec = (Date.now() - windowStart) / 1000;
+            if (elapsedSec >= BOT_FILL_END_SECOND) {
+                this.logger.debug(`Room ${roomId}: bot entry window closed at ${elapsedSec.toFixed(0)}s`);
+                break;
+            }
 
             const current = this.lobby.get(roomId);
             if (!current || current.status !== "WAITING") return;
 
+            // Stop when we have enough cards to start
             if (current.totalCards >= MIN_CARDS_TO_START) {
                 current.botFillInProgress = false;
                 this.lobby.set(roomId, current);
@@ -280,28 +432,34 @@ export class LobbyService {
 
             const bot = await this.botService.createRandomBot();
             this.addBotToLobby(roomId, bot);
+            botsAdded++;
 
             // Broadcast updated state
-            const status = this.getLobbyStatus(roomId);
-            this.server?.to(`lobby-${roomId}`).emit("lobby-update", status);
+            await this.broadcastRoomUpdates(roomId);
 
-            const allRooms = await this.getAllRoomsWithStatus();
-            this.server?.emit("rooms-status", allRooms);
-
-            // Wait 5–15s before next bot
+            // Wait between 5–15s before the next bot
             const delay = BOT_FILL_MIN_DELAY_MS + Math.random() * (BOT_FILL_MAX_DELAY_MS - BOT_FILL_MIN_DELAY_MS);
 
             await this.sleep(delay);
         }
 
-        // Give up
+        // If we exit the loop, we either hit MAX_BOTS or the window closed
         const final = this.lobby.get(roomId);
         if (final) {
             final.botFillInProgress = false;
             this.lobby.set(roomId, final);
+
+            // If we still have ≥ MIN cards, finalize
+            if (final.totalCards >= MIN_CARDS_TO_START) {
+                this.cancelWaiting(roomId);
+                await this.finalizeLobby(roomId);
+                return;
+            }
         }
 
-        this.logger.error(`Room ${roomId}: bot fill gave up after ${attempts} attempts`);
+        this.logger.warn(
+            `Room ${roomId}: bot fill ended with ${final?.totalCards ?? 0} cards (needs ${MIN_CARDS_TO_START})`
+        );
     }
 
     private addBotToLobby(roomId: string, bot: { username: string; cardCount: number }): void {
@@ -336,21 +494,20 @@ export class LobbyService {
 
             this.logger.debug(`Match ${matchId} created for room ${roomId}`);
 
+            // 👇 Start number calling
+            await this.matchService.beginNumberCalling(matchId);
+
             this.server?.to(`lobby-${roomId}`).emit("match-started", {
                 roomId,
                 matchId
             });
 
-            const allRooms = await this.getAllRoomsWithStatus();
-            this.server?.emit("rooms-status", allRooms);
-
+            await this.broadcastRoomUpdates(roomId);
             this.resetLobby(roomId);
         } catch (error: unknown) {
             this.logger.error(`Failed to start match for room ${roomId}:`, error);
-
             lobby.status = "WAITING";
             this.lobby.set(roomId, lobby);
-
             throw error;
         }
     }
@@ -364,7 +521,7 @@ export class LobbyService {
         lobby.status = "WAITING";
         lobby.createdAt = new Date().toISOString();
         lobby.firstPeriodTimeFired = false;
-        lobby.secondWindowFired = false;
+        lobby.secondPeriodTimeFired = false;
         lobby.botFillInProgress = false;
 
         this.lobby.set(roomId, lobby);
@@ -401,7 +558,7 @@ export class LobbyService {
                 players: [],
                 totalCards: 0,
                 firstPeriodTimeFired: false,
-                secondWindowFired: false,
+                secondPeriodTimeFired: false,
                 botFillInProgress: false
             });
         });

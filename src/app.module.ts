@@ -13,6 +13,7 @@ import { CardModule } from './card/card.module.js';
 import { MatchModule } from './match/match.module.js';
 import { ScheduleModule } from '@nestjs/schedule';
 import { BotModule } from './bot/bot.module.js';
+import { NotificationModule } from './notification/notification.module.js';
 
 @Module({
     imports: [
@@ -31,7 +32,8 @@ import { BotModule } from './bot/bot.module.js';
         TransactionModule,
         CardModule,
         MatchModule,
-        BotModule
+        BotModule,
+        NotificationModule
     ]
 })
 export class AppModule {}

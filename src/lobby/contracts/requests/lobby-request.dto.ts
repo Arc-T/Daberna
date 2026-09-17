@@ -1,5 +1,5 @@
 export interface LobbyPlayer {
-    id: string | null;      // null for bots
+    id: string | null; // null for bots
     name: string;
     cardCount: number;
     paidAmount: number;
@@ -15,7 +15,7 @@ export interface LobbyState {
 
     // runtime flags
     firstPeriodTimeFired: boolean;
-    secondWindowFired: boolean;
+    secondPeriodTimeFired: boolean;
     botFillInProgress: boolean;
 }
 
