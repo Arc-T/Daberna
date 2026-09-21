@@ -27,6 +27,10 @@ export class NumberCallerService implements OnModuleDestroy {
     // Ticker lifecycle
     // ─────────────────────────────────────────────────────────────
 
+    isRunning(matchId: string): boolean {
+        return this.tickers.has(matchId);
+    }
+
     start(matchId: string, onTick: TickCallback): void {
         if (this.tickers.has(matchId)) return;
 
@@ -76,6 +80,10 @@ export class NumberCallerService implements OnModuleDestroy {
         if (remaining.length === 0) return null;
 
         return remaining[Math.floor(Math.random() * remaining.length)];
+    }
+
+    hasPredeterminedOrder(matchId: string): boolean {
+        return this.predeterminedOrders.has(matchId);
     }
 
     // ─────────────────────────────────────────────────────────────

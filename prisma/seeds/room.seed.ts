@@ -1,36 +1,24 @@
 import { PrismaClient } from "../../generated/prisma/client.js";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-interface RawCard {
-    numbers: number[];
-    layout: { rows: number[]; cols: number[] };
-}
-
-export default async function seedCards(prisma: PrismaClient): Promise<void> {
-    // Idempotency — if cards already exist, skip
-    const existing = await prisma.card.count();
+export default async function seedRooms(prisma: PrismaClient): Promise<void> {
+    // Idempotency — if rooms already exist, skip
+    const existing = await prisma.room.count();
     if (existing > 0) {
-        console.log(`ℹ️  ${existing} cards already exist. Skipping card seeding.`);
+        console.log(`ℹ️  ${existing} rooms already exist. Skipping room seeding.`);
         return;
     }
 
-    const filePath = path.join(__dirname, "cards.json");
-    const raw = fs.readFileSync(filePath, "utf-8");
-    const cards = JSON.parse(raw) as RawCard[];
+    const rooms = [
+        { name: "IRON", entryFee: 100 },
+        { name: "BRONZE", entryFee: 200 },
+        { name: "SILVER", entryFee: 300 },
+        { name: "GOLD", entryFee: 400 }
+    ];
 
-    await prisma.card.createMany({
-        data: cards.map((c) => ({
-            numbers: c.numbers,
-            layout: c.layout,
-            isActive: true
-        })),
+    await prisma.room.createMany({
+        data: rooms,
         skipDuplicates: true
     });
 
-    console.log(`✅ Seeded ${cards.length} cards.`);
+    console.log(`✅ Seeded ${rooms.length} rooms.`);
 }

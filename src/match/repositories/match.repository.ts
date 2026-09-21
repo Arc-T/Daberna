@@ -13,11 +13,15 @@ export class MatchRepository {
                 room: true,
                 playerMatches: {
                     include: {
-                        user: { select: { id: true, username: true, isNewPlayer: true } },
-                        matchCards: {
-                            include: {
-                                card: true // 👈 needed for `mc.card.numbers` and `mc.card.layout`
+                        user: {
+                            select: {
+                                id: true,
+                                username: true,
+                                isNewPlayer: true
                             }
+                        },
+                        matchCards: {
+                            include: { card: true }
                         }
                     }
                 },

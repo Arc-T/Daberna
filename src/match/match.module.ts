@@ -9,10 +9,9 @@ import { MatchRepository } from "./repositories/match.repository.js";
 import { MatchGateway } from "./gateways/match.gateway.js";
 
 import { RoomModule } from "../room/room.module.js";
-import { NotificationModule } from "../notification/notification.module.js";
 
 @Module({
-    imports: [RoomModule, NotificationModule],
+    imports: [RoomModule],
     providers: [
         MatchService,
         MatchCardService,

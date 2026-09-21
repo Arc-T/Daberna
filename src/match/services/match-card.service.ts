@@ -42,11 +42,14 @@ export class MatchCardService {
 
         // 2. Insert MatchCard rows
         await tx.matchCard.createMany({
-            data: picked.map((c) => ({ matchId, cardId: c.id }))
+            data: picked.map((c: { id: string }) => ({
+                matchId,
+                cardId: c.id
+            }))
         });
 
         // 3. Shuffle and distribute
-        const shuffled = picked.map((c) => c.id).sort(() => Math.random() - 0.5);
+        const shuffled = picked.map((c: { id: string }) => c.id).sort(() => Math.random() - 0.5);
         let cursor = 0;
 
         for (const player of players) {

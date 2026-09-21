@@ -21,13 +21,20 @@ export class BotService {
     constructor(private readonly botRepository: BotRepository) {}
 
     /**
-     * Create a random bot with a unique username and realistic stats.
+     * Create a random bot.
+     *
+     * `realPlayerCards` — the total number of cards that real players
+     * have already committed to this lobby. The bot always gets
+     * `realPlayerCards + 1` (docs page 30).
      */
-    async createRandomBot(): Promise<BotDto> {
+    async createRandomBot(realPlayerCards: number): Promise<BotDto> {
         const username = await this.generateUniqueUsername();
         this.activeUsernames.add(username);
 
-        const cardCount = this.randomInt(BOT_MIN_CARDS, BOT_MAX_CARDS);
+        // Docs page 30: bot card count = real players' cards + 1, clamped
+        const rawCount = realPlayerCards + 1;
+        const cardCount = Math.min(Math.max(rawCount, BOT_MIN_CARDS), BOT_MAX_CARDS);
+
         const stats = this.generateStats();
 
         const bot: BotDto = { username, cardCount, stats };

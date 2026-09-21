@@ -27,6 +27,7 @@ import { UserRepository } from "../../user/repositories/user.repository.js";
 import { PrismaService } from "../../infrastructure/database/prisma.service.js";
 import { MatchService } from "../../match/services/match.service.js";
 import { BotService } from "../../bot/services/bot.service.js";
+import { BotDto } from "../../bot/contracts/response/bot.dto.js";
 
 @Injectable()
 export class LobbyService {
@@ -411,17 +412,12 @@ export class LobbyService {
         let botsAdded = 0;
 
         while (botsAdded < MAX_BOTS_PER_MATCH) {
-            // Guard: stop if the entry window has closed
             const elapsedSec = (Date.now() - windowStart) / 1000;
-            if (elapsedSec >= BOT_FILL_END_SECOND) {
-                this.logger.debug(`Room ${roomId}: bot entry window closed at ${elapsedSec.toFixed(0)}s`);
-                break;
-            }
+            if (elapsedSec >= BOT_FILL_END_SECOND) break;
 
             const current = this.lobby.get(roomId);
             if (!current || current.status !== "WAITING") return;
 
-            // Stop when we have enough cards to start
             if (current.totalCards >= MIN_CARDS_TO_START) {
                 current.botFillInProgress = false;
                 this.lobby.set(roomId, current);
@@ -430,14 +426,17 @@ export class LobbyService {
                 return;
             }
 
-            const bot = await this.botService.createRandomBot();
+            // 👇 Count REAL player cards only
+            const realPlayerCards = current.players
+                .filter((p) => p.id !== null)
+                .reduce((sum, p) => sum + p.cardCount, 0);
+
+            const bot = await this.botService.createRandomBot(realPlayerCards);
             this.addBotToLobby(roomId, bot);
             botsAdded++;
 
-            // Broadcast updated state
             await this.broadcastRoomUpdates(roomId);
 
-            // Wait between 5–15s before the next bot
             const delay = BOT_FILL_MIN_DELAY_MS + Math.random() * (BOT_FILL_MAX_DELAY_MS - BOT_FILL_MIN_DELAY_MS);
 
             await this.sleep(delay);
@@ -462,18 +461,24 @@ export class LobbyService {
         );
     }
 
-    private addBotToLobby(roomId: string, bot: { username: string; cardCount: number }): void {
+    private addBotToLobby(roomId: string, bot: BotDto): void {
         const lobby = this.lobby.get(roomId);
         if (!lobby) return;
+
+        // Clamp so we never exceed the 30-card match capacity
+        const remaining = MAX_CARDS_PER_MATCH - lobby.totalCards;
+        const cardCount = Math.min(bot.cardCount, remaining);
+
+        if (cardCount <= 0) return;
 
         lobby.players.push({
             id: null,
             name: bot.username,
-            cardCount: bot.cardCount,
+            cardCount,
             paidAmount: 0,
             joinedAt: new Date().toISOString()
         });
-        lobby.totalCards += bot.cardCount;
+        lobby.totalCards += cardCount;
 
         this.lobby.set(roomId, lobby);
     }

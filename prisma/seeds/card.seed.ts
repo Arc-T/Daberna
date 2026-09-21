@@ -1,34 +1,36 @@
-// scripts/insert-cards.ts
-import "dotenv/config";
+import { PrismaClient } from "../../generated/prisma/client.js";
 import fs from "node:fs";
-import { PrismaPg } from "@prisma/adapter-pg";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
-const prisma = new PrismaClient({ adapter });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-async function main() {
-    const raw = fs.readFileSync("cards.json", "utf-8");
-    const cards = JSON.parse(raw) as {
-        numbers: number[];
-        layout: { rows: number[]; cols: number[] };
-    }[];
+interface RawCard {
+    numbers: number[];
+    layout: { rows: number[]; cols: number[] };
+}
 
-    console.log(`Inserting ${cards.length} cards...`);
+export default async function seedCards(prisma: PrismaClient): Promise<void> {
+    // Idempotency — if cards already exist, skip
+    const existing = await prisma.card.count();
+    if (existing > 0) {
+        console.log(`ℹ️  ${existing} cards already exist. Skipping card seeding.`);
+        return;
+    }
+
+    const filePath = path.join(__dirname, "cards.json");
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const cards = JSON.parse(raw) as RawCard[];
 
     await prisma.card.createMany({
         data: cards.map((c) => ({
             numbers: c.numbers,
             layout: c.layout,
             isActive: true
-        }))
+        })),
+        skipDuplicates: true
     });
 
-    console.log("🎉 Done.");
+    console.log(`✅ Seeded ${cards.length} cards.`);
 }
-
-main()
-    .catch((e) => {
-        console.error(e);
-        process.exit(1);
-    })
-    .finally(() => prisma.$disconnect());

@@ -1,4 +1,8 @@
+// src/match/services/match.service.ts
+
 import { Injectable, Logger, NotFoundException, BadRequestException } from "@nestjs/common";
+import { WsException } from "@nestjs/websockets";
+import { Server } from "socket.io";
 
 import { PrismaService } from "../../infrastructure/database/prisma.service.js";
 import { RoomRepository } from "../../room/repositories/room.repository.js";
@@ -10,8 +14,6 @@ import { MatchPrizeService } from "./match-prize.service.js";
 
 import type { LobbyState } from "../../lobby/contracts/requests/lobby-request.dto.js";
 import { MatchStatus, PlayerMatchResult, NotificationType } from "../../../generated/prisma/client.js";
-import { MatchCardSnapshot, MatchSnapshotDto } from "../contracts/responses/match-snapshot.dto.js";
-import { Server } from "socket.io";
 
 const PLATFORM_CUT_RATE = 0.1;
 const LINE_POOL_RATE = 0.1;
@@ -23,19 +25,19 @@ export class MatchService {
 
     private server: Server;
 
+    constructor(
+        private readonly prisma: PrismaService,
+        private readonly cardService: MatchCardService,
+        private readonly roomRepository: RoomRepository,
+        private readonly prizeService: MatchPrizeService,
+        private readonly matchRepository: MatchRepository,
+        private readonly numberCaller: NumberCallerService,
+        private readonly winnerDetector: WinnerDetectorService
+    ) {}
+
     setServer(server: Server) {
         this.server = server;
     }
-
-    constructor(
-        private readonly prisma: PrismaService,
-        private readonly matchRepository: MatchRepository,
-        private readonly roomRepository: RoomRepository,
-        private readonly cardService: MatchCardService,
-        private readonly winnerDetector: WinnerDetectorService,
-        private readonly numberCaller: NumberCallerService,
-        private readonly prizeService: MatchPrizeService
-    ) {}
 
     // ─────────────────────────────────────────────────────────────
     // Create
@@ -79,12 +81,17 @@ export class MatchService {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Number calling lifecycle
+    // Number calling
     // ─────────────────────────────────────────────────────────────
 
     async beginNumberCalling(matchId: string): Promise<void> {
+        if (this.numberCaller.isRunning(matchId)) return;
+
         await this.preparePredeterminedOrderIfNeeded(matchId);
+
         this.numberCaller.start(matchId, (id) => this.tickMatch(id));
+
+        this.logger.log(`Number calling started for match ${matchId}`);
     }
 
     private async tickMatch(matchId: string): Promise<void> {
@@ -95,7 +102,6 @@ export class MatchService {
             return this.numberCaller.stop(matchId);
         }
 
-        // 1. Pick next number
         const called = (match.calledNumbers as number[]) ?? [];
         const next = this.numberCaller.pickNext(called, matchId);
 
@@ -104,26 +110,26 @@ export class MatchService {
             return this.numberCaller.stop(matchId);
         }
 
-        // 2. Persist
+        const updatedCalled = [...called, next];
+
+        // Persist
         await this.prisma.match.update({
             where: { id: matchId },
             data: {
-                calledNumbers: [...called, next],
+                calledNumbers: updatedCalled,
                 matchNumbers: {
                     create: { number: next, orderIndex: called.length }
                 }
             }
         });
 
-        const updatedCalled = [...called, next];
-        const visible = updatedCalled.slice(-5);
-
+        // 👇 emit
         this.emitNumberCalled(matchId, next, updatedCalled);
 
-        // 3. Check winners
+        // Check winners
         await this.checkForWinners(matchId, next, match);
 
-        // 4. Re-check match status
+        // Re-read
         const updated = await this.matchRepository.findById(matchId);
         if (updated?.status === MatchStatus.COMPLETED || updated?.status === MatchStatus.CANCELLED) {
             this.numberCaller.stop(matchId);
@@ -131,16 +137,25 @@ export class MatchService {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Winner detection & declaration
+    // Winner detection
     // ─────────────────────────────────────────────────────────────
 
     private async checkForWinners(matchId: string, calledNumber: number, match: any): Promise<void> {
         const calledSet = new Set<number>((match.calledNumbers as number[]) ?? []);
         calledSet.add(calledNumber);
 
+        const isNewPlayerMatch = this.numberCaller.hasPredeterminedOrder(matchId);
+
+        // In a new-player match, only the new player can win
+        const pool = isNewPlayerMatch
+            ? match.playerMatches.filter((pm: any) => pm.user?.isNewPlayer)
+            : match.playerMatches;
+
+        if (pool.length === 0) return;
+
         // Line
         if (!match.lineWinnerId) {
-            const lineWinners = this.winnerDetector.findLineWinners(match.playerMatches, calledSet);
+            const lineWinners = this.winnerDetector.findLineWinners(pool, calledSet);
             if (lineWinners.length > 0) {
                 await this.declareLineWinners(
                     matchId,
@@ -152,7 +167,7 @@ export class MatchService {
 
         // Full house
         if (!match.fullHouseWinnerId) {
-            const fhWinners = this.winnerDetector.findFullHouseWinners(match.playerMatches, calledSet);
+            const fhWinners = this.winnerDetector.findFullHouseWinners(pool, calledSet);
             if (fhWinners.length > 0) {
                 await this.declareFullHouseWinners(
                     matchId,
@@ -161,6 +176,10 @@ export class MatchService {
             }
         }
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Declare line winners
+    // ─────────────────────────────────────────────────────────────
 
     private async declareLineWinners(matchId: string, playerMatchIds: string[]): Promise<void> {
         if (playerMatchIds.length === 0) return;
@@ -208,20 +227,25 @@ export class MatchService {
             }
         });
 
+        this.logger.log(`Line winners in ${matchId}: ${winners.length} × ${perWinner}`);
+
+        // 👇 emit
         this.emitLineWinner(
             matchId,
             winners.map((pm) => ({
                 playerMatchId: pm.id,
                 userId: pm.userId,
-                username: pm.user?.username ?? pm.botUsername ?? "BOT",
+                username: pm.user?.username ?? pm.botUsername ?? "بات",
                 isBot: pm.isBot,
                 prize: perWinner
             })),
             linePool
         );
-
-        this.logger.log(`Line winners in ${matchId}: ${winners.length} × ${perWinner}`);
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Declare full-house winners
+    // ─────────────────────────────────────────────────────────────
 
     private async declareFullHouseWinners(matchId: string, playerMatchIds: string[]): Promise<void> {
         if (playerMatchIds.length === 0) return;
@@ -268,43 +292,36 @@ export class MatchService {
                 });
             }
 
-            // Mark non-winners
+            // Mark remaining as LOST
             await tx.playerMatch.updateMany({
                 where: { matchId, result: PlayerMatchResult.PENDING },
                 data: { result: PlayerMatchResult.LOST }
             });
         });
 
-        this.server.to(`match-${matchId}`).emit("full-house-winner", {
+        this.numberCaller.clearPredeterminedOrder(matchId);
+        this.numberCaller.stop(matchId);
+
+        this.logger.log(`Full-house winners in ${matchId}: ${winners.length} × ${perWinner}`);
+
+        // 👇 emit
+        this.emitFullHouseWinner(
             matchId,
-            winners: winners.map((pm) => ({
+            winners.map((pm) => ({
                 playerMatchId: pm.id,
                 userId: pm.userId,
                 username: pm.user?.username ?? pm.botUsername ?? "بات",
                 isBot: pm.isBot,
                 prize: perWinner
             })),
-            pool: fullHousePool
-        });
-
-        // Also emit the final "match-ended" event
-        this.emitFullHouseWinner(
-            matchId,
-            winners.map((pm) => ({
-                playerMatchId: pm.id,
-                userId: pm.userId,
-                username: pm.user?.username ?? pm.botUsername ?? "BOT",
-                isBot: pm.isBot,
-                prize: perWinner
-            })),
             fullHousePool
         );
 
-        this.logger.log(`Full-house winners in ${matchId}: ${winners.length} × ${perWinner}`);
+        this.emitMatchEnded(matchId);
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Read
+    // Snapshot
     // ─────────────────────────────────────────────────────────────
 
     async getSnapshot(matchId: string, requestingUserId?: string) {
@@ -324,7 +341,6 @@ export class MatchService {
             startTime: match.startTime,
             players: match.playerMatches.map((pm) => {
                 const isSelf = requestingUserId && pm.userId === requestingUserId;
-                const cards = isSelf ? pm.matchCards.map((mc) => this.buildCardSnapshot(mc.card, called)) : undefined;
 
                 return {
                     playerMatchId: pm.id,
@@ -336,77 +352,12 @@ export class MatchService {
                     fullHouseWinner: pm.fullHouseWinner,
                     result: pm.result,
                     prizeAmount: Number(pm.prizeAmount ?? 0),
-                    cards
+
+                    // all players' cards (public per docs page 17)
+                    cards: pm.matchCards.map((mc) => this.buildCardSnapshot(mc.card, called))
                 };
             })
         };
-    }
-
-    async findById(matchId: string) {
-        return this.matchRepository.findById(matchId);
-    }
-
-    async findActiveByRoom(roomId: string) {
-        return this.matchRepository.findActiveByRoom(roomId);
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // Lifecycle
-    // ─────────────────────────────────────────────────────────────
-
-    async finishMatch(matchId: string): Promise<void> {
-        const match = await this.matchRepository.findById(matchId);
-        if (!match) throw new NotFoundException("مچ پیدا نشد.");
-
-        await this.prisma.match.update({
-            where: { id: matchId },
-            data: { status: MatchStatus.COMPLETED, endTime: new Date() }
-        });
-
-        this.numberCaller.stop(matchId);
-        this.numberCaller.clearPredeterminedOrder(matchId);
-
-        this.logger.log(`Match ${matchId} finished.`);
-    }
-
-    async cancelMatch(matchId: string, reason: string): Promise<void> {
-        const match = await this.matchRepository.findById(matchId);
-        if (!match) throw new NotFoundException("مچ پیدا نشد.");
-
-        this.numberCaller.stop(matchId);
-        this.numberCaller.clearPredeterminedOrder(matchId);
-
-        await this.prisma.$transaction(async (tx) => {
-            await tx.match.update({
-                where: { id: matchId },
-                data: { status: MatchStatus.CANCELLED, endTime: new Date() }
-            });
-
-            for (const pm of match.playerMatches) {
-                if (pm.isBot || !pm.userId) continue;
-
-                await this.prizeService.refund(tx, pm.userId, Number(pm.entryAmount), matchId);
-            }
-        });
-
-        this.logger.warn(`Match ${matchId} cancelled: ${reason}`);
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // New-player predetermined order
-    // ─────────────────────────────────────────────────────────────
-
-    private async preparePredeterminedOrderIfNeeded(matchId: string): Promise<void> {
-        const match = await this.matchRepository.findById(matchId);
-        if (!match) return;
-
-        const newPlayer = match.playerMatches.find((pm) => pm.user?.isNewPlayer);
-        if (!newPlayer) return;
-
-        const firstCard = newPlayer.matchCards?.[0]?.card;
-        if (!firstCard) return;
-
-        this.numberCaller.setPredeterminedOrder(matchId, firstCard.numbers as number[]);
     }
 
     private buildCardSnapshot(card: { id: string; numbers: any; layout: any }, called: number[]) {
@@ -428,7 +379,6 @@ export class MatchService {
 
     private emitNumberCalled(matchId: string, number: number, allCalled: number[]): void {
         const visible = allCalled.slice(-5);
-
         this.server?.to(`match-${matchId}`).emit("number-called", {
             matchId,
             number,
@@ -439,7 +389,13 @@ export class MatchService {
 
     private emitLineWinner(
         matchId: string,
-        winners: { playerMatchId: string; userId: string | null; username: string; isBot: boolean; prize: number }[],
+        winners: {
+            playerMatchId: string;
+            userId: string | null;
+            username: string;
+            isBot: boolean;
+            prize: number;
+        }[],
         pool: number
     ): void {
         this.server?.to(`match-${matchId}`).emit("line-winner", {
@@ -451,7 +407,13 @@ export class MatchService {
 
     private emitFullHouseWinner(
         matchId: string,
-        winners: { playerMatchId: string; userId: string | null; username: string; isBot: boolean; prize: number }[],
+        winners: {
+            playerMatchId: string;
+            userId: string | null;
+            username: string;
+            isBot: boolean;
+            prize: number;
+        }[],
         pool: number
     ): void {
         this.server?.to(`match-${matchId}`).emit("full-house-winner", {
@@ -466,5 +428,57 @@ export class MatchService {
             matchId,
             endedAt: new Date()
         });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────
+
+    async finishMatch(matchId: string): Promise<void> {
+        await this.prisma.match.update({
+            where: { id: matchId },
+            data: {
+                status: MatchStatus.COMPLETED,
+                endTime: new Date()
+            }
+        });
+
+        this.numberCaller.stop(matchId);
+        this.numberCaller.clearPredeterminedOrder(matchId);
+
+        this.emitMatchEnded(matchId);
+
+        this.logger.log(`Match ${matchId} finished.`);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // New-player predetermined order
+    // ─────────────────────────────────────────────────────────────
+
+    private async preparePredeterminedOrderIfNeeded(matchId: string): Promise<void> {
+        const match = await this.matchRepository.findById(matchId);
+        if (!match) return;
+
+        const newPlayer = match.playerMatches.find((pm) => pm.user?.isNewPlayer === true);
+        if (!newPlayer) return;
+
+        const firstCard = newPlayer.matchCards?.[0]?.card;
+        if (!firstCard) return;
+
+        this.numberCaller.setPredeterminedOrder(matchId, firstCard.numbers as number[]);
+
+        this.logger.log(`Predetermined order set for match ${matchId} (new player: ${newPlayer.user?.username})`);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Read
+    // ─────────────────────────────────────────────────────────────
+
+    async findById(matchId: string) {
+        return this.matchRepository.findById(matchId);
+    }
+
+    async findActiveByRoom(roomId: string) {
+        return this.matchRepository.findActiveByRoom(roomId);
     }
 }
